@@ -136,7 +136,7 @@ class MCMC(CovmatSampler):
         collection = collections[0]
         if len(collections) > 1:
             for c in collections[1:]:
-                collection.append(c)
+                collection._append(c)
 
         # Find global row with min minuslogpost (MAP)
         best_row = collection.MAP()
@@ -153,6 +153,7 @@ class MCMC(CovmatSampler):
                 "Will sample their initial values from their prior/ref.",
                 missing
             )
+            self.max_tries.set_scale(self.model.prior.d())
             initial_point, _ = self.model.get_valid_point(
                 max_tries=int(min(self.max_tries.value, 1e7)), random_state=self._rng
             )
@@ -197,10 +198,6 @@ class MCMC(CovmatSampler):
         if not self.model.prior.d():
             raise LoggedError(self.log, "No parameters being varied for sampler")
         self.log.debug("Initializing")
-        
-        if self.start_from:
-            self._initial_point_start_from, \
-            self._results_start_from = self._load_start_from()
 
         if self.callback_every is None:
             self.callback_every = self.learn_every
@@ -210,6 +207,11 @@ class MCMC(CovmatSampler):
             self._quants_d_units.append(number)
             setattr(self, q, number)
         self.output_every = NumberWithUnits(self.output_every, "s", dtype=int)
+
+        if self.start_from:
+            self._initial_point_start_from, \
+                self._results_start_from = self._load_start_from()
+
         if self.temperature is None:
             self.temperature = 1
         elif self.temperature < 1:
