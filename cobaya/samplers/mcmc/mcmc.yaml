@@ -13,6 +13,9 @@ max_tries: 40d
 # - "auto" (cosmology runs only): will be looked up in a library
 covmat:
 covmat_params:
+# Path prefix of an existing chain (e.g. chains/myrun).
+# Starts from its best-fit point and loads its .covmat file as the proposal.
+start_from:
 # Overall scale of the proposal pdf (increase for longer steps)
 proposal_scale: 2.4
 # Update output file(s) and print some info

@@ -302,3 +302,64 @@ def _test_overhead_timing(dim=15):
     ps.sort_stats("cumtime")
     ps.print_stats(print_n_calls)
     print(s.getvalue())
+
+def test_start_from(tmpdir):
+    import os
+    import numpy as np
+    from cobaya.conventions import OutPar
+    
+    like_test = _make_gaussian_like(3)
+    info1 = {
+        "likelihood": {"like": like_test},
+        "sampler": {"mcmc": {"max_samples": 50, "burn_in": 0, "learn_proposal": False}},
+        "output": os.path.join(tmpdir, "chain1"),
+        "force": True,
+    }
+    
+    run(info1)
+    
+    # We need the model for loading
+    from cobaya.model import get_model
+    model1 = get_model(info1)
+    
+    from cobaya.output import OutputReadOnly
+    out1 = OutputReadOnly(os.path.join(tmpdir, "chain1"))
+    collection1 = out1.load_collections(model1)[0]
+    best_row1 = collection1.MAP()
+    best_point1 = best_row1[["x0", "x1", "x2"]].to_numpy(dtype=np.float64)
+    
+    # Run second chain with start_from
+    info2 = {
+        "likelihood": {"like": like_test},
+        "sampler": {
+            "mcmc": {
+                "start_from": os.path.join(tmpdir, "chain1"),
+                "max_samples": 10,
+                "burn_in": 0,
+            }
+        },
+        "output": os.path.join(tmpdir, "chain2"),
+        "force": True,
+    }
+    updated_info2, sampler2 = run(info2)
+    
+    np.testing.assert_allclose(sampler2._initial_point_start_from, best_point1)
+    
+    # Since learn_proposal=False in chain1, it should have computed covmat from samples.
+    # Now let's try with a covmat file existing.
+    covmat = np.eye(3)
+    np.savetxt(os.path.join(tmpdir, "chain1.covmat"), covmat, header="x0 x1 x2")
+    
+    info3 = {
+        "likelihood": {"like": like_test},
+        "sampler": {
+            "mcmc": {
+                "start_from": os.path.join(tmpdir, "chain1"),
+                "max_samples": 10,
+                "burn_in": 0,
+            }
+        },
+        "output": os.path.join(tmpdir, "chain3"),
+        "force": True,
+    }
+    run(info3)

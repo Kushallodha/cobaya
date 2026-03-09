@@ -68,6 +68,7 @@ class MCMC(CovmatSampler):
         "Rminus1_cl_level",
         "covmat",
         "covmat_params",
+        "start_from",
     ]
     _at_resume_prefer_old = CovmatSampler._at_resume_prefer_old + [
         "proposal_scale",
@@ -99,6 +100,7 @@ class MCMC(CovmatSampler):
     measure_speeds: bool
     oversample_thin: int
     oversample_power: float
+    start_from: str | None
 
     def set_instance_defaults(self):
         """Ensure that checkpoint attributes are initialized correctly."""
@@ -108,6 +110,85 @@ class MCMC(CovmatSampler):
         self.mpi_size = None
         self.Rminus1_last = np.inf
 
+    def _load_start_from(self):
+        """
+        Loads the best-fit point and covariance matrix from a previous chain.
+        Returns (initial_point, results).
+        """
+        if self.output.is_resuming():
+            raise LoggedError(
+                self.log,
+                "Cannot use 'start_from' at the same time as 'resume' (or output prefix match)."
+            )
+
+        from cobaya.output import OutputReadOnly
+        out = OutputReadOnly(self.start_from)
+        
+        try:
+            collections = out.load_collections(self.model)
+        except OSError:
+            collections = None
+            
+        if not collections:
+            raise LoggedError(self.log, "No chain files found for start_from: %s", self.start_from)
+
+        # Concatenate if multiple
+        collection = collections[0]
+        if len(collections) > 1:
+            for c in collections[1:]:
+                collection.append(c)
+
+        # Find global row with min minuslogpost (MAP)
+        best_row = collection.MAP()
+
+        # Extract sampled param values aligned to current model's sampled_params
+        sampled_params = list(self.model.parameterization.sampled_params())
+        missing = [p for p in sampled_params if p not in best_row.index]
+        if missing:
+            # We must assign values for the missing params (from prior/ref), but evaluating the 
+            # posterior requires them. As a fallback, we can use the model's get_valid_point 
+            # to generate a full point, then overwrite the params we DO have from best_row.
+            self.log.info(
+                "Parameters %s missing from start_from chain. "
+                "Will sample their initial values from their prior/ref.",
+                missing
+            )
+            initial_point, _ = self.model.get_valid_point(
+                max_tries=int(min(self.max_tries.value, 1e7)), random_state=self._rng
+            )
+            for i, p in enumerate(sampled_params):
+                if p not in missing:
+                    initial_point[i] = best_row[p]
+            
+            # Since we replaced values, the logposterior stored in the old chain is no longer valid.
+            # We must re-evaluate it for the new point.
+            results = self.model.logposterior(initial_point)
+            
+        else:
+            initial_point = best_row[sampled_params].to_numpy(dtype=np.float64, copy=True)
+            # Build a LogPosterior reusing collection properties
+            results = LogPosterior(
+                logpost=-remove_temperature(best_row[OutPar.minuslogpost], self.temperature),
+                logpriors=-(best_row[collection.minuslogprior_names].to_numpy(dtype=np.float64, copy=True)) if collection.minuslogprior_names else None,
+                loglikes=-0.5 * (best_row[collection.chi2_names].to_numpy(dtype=np.float64, copy=True)) if collection.chi2_names else None,
+                derived=(best_row[collection.derived_params].to_numpy(dtype=np.float64, copy=True)) if collection.derived_params else None,
+            )
+
+        # Load or compute covmat, setting it on self so CovmatSampler handles it
+        covmat_file = self.start_from + ".covmat"
+        try:
+            with open(covmat_file, encoding="utf-8-sig"):
+                pass
+            self.covmat = covmat_file
+            self.log.info("Will load covariance matrix from %s", covmat_file)
+        except OSError:
+            # Compute from samples
+            self.log.info("Computing covariance matrix from samples in %s", self.start_from)
+            self.covmat = collection.cov(derived=False)
+            self.covmat_params = list(collection.sampled_params)
+
+        return initial_point, results
+
     def initialize(self):
         """
         Initializes the sampler: creates the proposal distribution and draws the initial
@@ -116,6 +197,11 @@ class MCMC(CovmatSampler):
         if not self.model.prior.d():
             raise LoggedError(self.log, "No parameters being varied for sampler")
         self.log.debug("Initializing")
+        
+        if self.start_from:
+            self._initial_point_start_from, \
+            self._results_start_from = self._load_start_from()
+
         if self.callback_every is None:
             self.callback_every = self.learn_every
         self._quants_d_units = []
@@ -212,6 +298,11 @@ class MCMC(CovmatSampler):
                     .to_numpy(dtype=np.float64, copy=True)
                 ),
             )
+        elif self.start_from:
+            if more_than_one_process() and is_main_process():
+                self.log.info("MPI is active: all chains will start from the same start_from point.")
+            initial_point = self._initial_point_start_from
+            results = self._results_start_from
         else:
             # NB: max_tries adjusted to dim instead of #cycles (blocking not computed yet)
             self.max_tries.set_scale(self.model.prior.d())
