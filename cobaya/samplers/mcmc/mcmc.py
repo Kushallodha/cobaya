@@ -6,6 +6,7 @@
 """
 
 import datetime
+import os
 import re
 from collections.abc import Callable, Sequence
 from itertools import chain
@@ -112,8 +113,21 @@ class MCMC(CovmatSampler):
 
     def _load_start_from(self):
         """
-        Loads the best-fit point and covariance matrix from a previous chain.
-        Returns (initial_point, results).
+        Loads the best-fit point and covariance matrix from a previous run.
+
+        Supports loading from:
+
+        - MCMC chain files (``{prefix}.{N}.txt``): uses the MAP (maximum a-posteriori)
+          point across all chains.
+        - Minimize output files (``{prefix}.minimum.txt`` or ``{prefix}.bestfit.txt``):
+          uses the single stored point.
+
+        The covariance matrix is loaded from ``{prefix}.covmat`` when present. For
+        multi-point collections (MCMC chains) without a ``.covmat`` file, the covariance
+        is estimated from the samples. For single-point collections (minimize output)
+        without a ``.covmat`` file, no covariance is set and the default proposal is used.
+
+        Returns ``(initial_point, results)``.
         """
         if self.output.is_resuming():
             raise LoggedError(
@@ -122,21 +136,42 @@ class MCMC(CovmatSampler):
             )
 
         from cobaya.output import OutputReadOnly
-        out = OutputReadOnly(self.start_from)
-        
         try:
-            collections = out.load_collections(self.model)
+            out = OutputReadOnly(self.start_from)
         except OSError:
-            collections = None
-            
-        if not collections:
-            raise LoggedError(self.log, "No chain files found for start_from: %s", self.start_from)
+            raise LoggedError(
+                self.log,
+                "Output prefix for 'start_from' not found: %s", self.start_from
+            )
 
-        # Concatenate if multiple
+        # Try MCMC chain files first, then minimize output files
+        collections = out.load_collections(self.model)
+        if not collections:
+            # Try MAP from minimize sampler (.minimum.txt)
+            collections = out.load_collections(
+                self.model, name="minimum", check_logp_sums=False
+            )
+        if not collections:
+            # Try best-fit from maximize-likelihood minimizer (.bestfit.txt)
+            collections = out.load_collections(
+                self.model, name="bestfit", check_logp_sums=False
+            )
+        if not collections:
+            raise LoggedError(
+                self.log,
+                "No chain or minimizer output files found for start_from: %s",
+                self.start_from,
+            )
+
+        is_single_point = len(collections) == 1 and len(collections[0]) == 1
+
+        # Concatenate if multiple chains
         collection = collections[0]
-        if len(collections) > 1:
-            for c in collections[1:]:
-                collection.append(c)
+        for c in collections[1:]:
+            collection._append(c)
+
+        # After concatenation, a single point means no useful covariance can be computed
+        is_single_point = len(collection) == 1
 
         # Find global row with min minuslogpost (MAP)
         best_row = collection.MAP()
@@ -145,9 +180,7 @@ class MCMC(CovmatSampler):
         sampled_params = list(self.model.parameterization.sampled_params())
         missing = [p for p in sampled_params if p not in best_row.index]
         if missing:
-            # We must assign values for the missing params (from prior/ref), but evaluating the 
-            # posterior requires them. As a fallback, we can use the model's get_valid_point 
-            # to generate a full point, then overwrite the params we DO have from best_row.
+            # Assign values for missing params from prior/ref, then overwrite known ones.
             self.log.info(
                 "Parameters %s missing from start_from chain. "
                 "Will sample their initial values from their prior/ref.",
@@ -159,33 +192,46 @@ class MCMC(CovmatSampler):
             for i, p in enumerate(sampled_params):
                 if p not in missing:
                     initial_point[i] = best_row[p]
-            
-            # Since we replaced values, the logposterior stored in the old chain is no longer valid.
-            # We must re-evaluate it for the new point.
+            # Re-evaluate since some values were replaced
             results = self.model.logposterior(initial_point)
-            
         else:
             initial_point = best_row[sampled_params].to_numpy(dtype=np.float64, copy=True)
-            # Build a LogPosterior reusing collection properties
+            # Reconstruct LogPosterior from the stored values
             results = LogPosterior(
                 logpost=-remove_temperature(best_row[OutPar.minuslogpost], self.temperature),
-                logpriors=-(best_row[collection.minuslogprior_names].to_numpy(dtype=np.float64, copy=True)) if collection.minuslogprior_names else None,
-                loglikes=-0.5 * (best_row[collection.chi2_names].to_numpy(dtype=np.float64, copy=True)) if collection.chi2_names else None,
-                derived=(best_row[collection.derived_params].to_numpy(dtype=np.float64, copy=True)) if collection.derived_params else None,
+                logpriors=-(
+                    best_row[collection.minuslogprior_names].to_numpy(
+                        dtype=np.float64, copy=True
+                    )
+                ) if collection.minuslogprior_names else None,
+                loglikes=-0.5 * (
+                    best_row[collection.chi2_names].to_numpy(dtype=np.float64, copy=True)
+                ) if collection.chi2_names else None,
+                derived=(
+                    best_row[collection.derived_params].to_numpy(dtype=np.float64, copy=True)
+                ) if collection.derived_params else None,
             )
 
         # Load or compute covmat, setting it on self so CovmatSampler handles it
         covmat_file = self.start_from + ".covmat"
-        try:
-            with open(covmat_file, encoding="utf-8-sig"):
-                pass
+        if os.path.exists(covmat_file):
             self.covmat = covmat_file
             self.log.info("Will load covariance matrix from %s", covmat_file)
-        except OSError:
-            # Compute from samples
-            self.log.info("Computing covariance matrix from samples in %s", self.start_from)
+        elif not is_single_point:
+            # Estimate covariance from the MCMC samples
+            self.log.info(
+                "Computing covariance matrix from samples in %s", self.start_from
+            )
             self.covmat = collection.cov(derived=False)
             self.covmat_params = list(collection.sampled_params)
+        else:
+            # Single-point collection (minimize output) and no .covmat file:
+            # fall back to the default proposal covariance
+            self.log.info(
+                "No covariance matrix found for start_from: %s. "
+                "Will use the default proposal covariance.",
+                self.start_from,
+            )
 
         return initial_point, results
 
