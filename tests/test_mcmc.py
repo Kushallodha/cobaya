@@ -307,7 +307,7 @@ def test_start_from(tmpdir):
     import os
     import numpy as np
     from cobaya.conventions import OutPar
-    
+
     like_test = _make_gaussian_like(3)
     info1 = {
         "likelihood": {"like": like_test},
@@ -315,20 +315,20 @@ def test_start_from(tmpdir):
         "output": os.path.join(tmpdir, "chain1"),
         "force": True,
     }
-    
+
     run(info1)
-    
+
     # We need the model for loading
     from cobaya.model import get_model
     model1 = get_model(info1)
-    
+
     from cobaya.output import OutputReadOnly
     out1 = OutputReadOnly(os.path.join(tmpdir, "chain1"))
     collection1 = out1.load_collections(model1)[0]
     best_row1 = collection1.MAP()
     best_point1 = best_row1[["x0", "x1", "x2"]].to_numpy(dtype=np.float64)
-    
-    # Run second chain with start_from
+
+    # Run second chain with start_from pointing to MCMC chains
     info2 = {
         "likelihood": {"like": like_test},
         "sampler": {
@@ -342,14 +342,14 @@ def test_start_from(tmpdir):
         "force": True,
     }
     updated_info2, sampler2 = run(info2)
-    
+
     np.testing.assert_allclose(sampler2._initial_point_start_from, best_point1)
-    
+
     # Since learn_proposal=False in chain1, it should have computed covmat from samples.
     # Now let's try with a covmat file existing.
     covmat = np.eye(3)
     np.savetxt(os.path.join(tmpdir, "chain1.covmat"), covmat, header="x0 x1 x2")
-    
+
     info3 = {
         "likelihood": {"like": like_test},
         "sampler": {
@@ -363,3 +363,71 @@ def test_start_from(tmpdir):
         "force": True,
     }
     run(info3)
+
+
+def test_start_from_minimize(tmpdir):
+    """Test that start_from can load initial point from minimize sampler output."""
+    import os
+    import numpy as np
+
+    like_test = _make_gaussian_like(3)
+
+    # Run minimize to produce .minimum.txt output
+    info_min = {
+        "likelihood": {"like": like_test},
+        "sampler": {"minimize": {"ignore_prior": False, "method": "scipy", "best_of": 1}},
+        "output": os.path.join(tmpdir, "min1"),
+        "force": True,
+    }
+    _, sampler_min = run(info_min)
+    min_point = sampler_min.products()["minimum"]
+
+    # Run MCMC starting from minimize output (.minimum.txt)
+    info_mcmc = {
+        "likelihood": {"like": like_test},
+        "sampler": {
+            "mcmc": {
+                "start_from": os.path.join(tmpdir, "min1"),
+                "max_samples": 10,
+                "burn_in": 0,
+            }
+        },
+        "output": os.path.join(tmpdir, "chain_from_min"),
+        "force": True,
+    }
+    _, sampler_mcmc = run(info_mcmc)
+
+    # Check that the initial point matches the minimize result
+    np.testing.assert_allclose(
+        sampler_mcmc._initial_point_start_from,
+        min_point.MAP()[["x0", "x1", "x2"]].to_numpy(dtype=np.float64),
+    )
+
+    # Now run minimize with ignore_prior=True to produce .bestfit.txt and test loading
+    info_bestfit = {
+        "likelihood": {"like": like_test},
+        "sampler": {"minimize": {"ignore_prior": True, "method": "scipy", "best_of": 1}},
+        "output": os.path.join(tmpdir, "bestfit1"),
+        "force": True,
+    }
+    _, sampler_bf = run(info_bestfit)
+    bf_point = sampler_bf.products()["minimum"]
+
+    info_mcmc_bf = {
+        "likelihood": {"like": like_test},
+        "sampler": {
+            "mcmc": {
+                "start_from": os.path.join(tmpdir, "bestfit1"),
+                "max_samples": 10,
+                "burn_in": 0,
+            }
+        },
+        "output": os.path.join(tmpdir, "chain_from_bestfit"),
+        "force": True,
+    }
+    _, sampler_mcmc_bf = run(info_mcmc_bf)
+
+    np.testing.assert_allclose(
+        sampler_mcmc_bf._initial_point_start_from,
+        bf_point.MAP()[["x0", "x1", "x2"]].to_numpy(dtype=np.float64),
+    )
